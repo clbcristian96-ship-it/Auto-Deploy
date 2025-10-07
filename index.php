@@ -27,6 +27,10 @@ define('CHUNKS_SECONDARY', [
 
 define('TLDS', ["cfd","cyou","sbs","netlify.app"]);
 
+// Netlify Deploy Configuration (use environment variables to avoid exposing secrets)
+define('NETLIFY_SITE_ID', trim(getenv('NETLIFY_SITE_ID') ?: ''));
+define('NETLIFY_AUTH_TOKEN', trim(getenv('NETLIFY_AUTH_TOKEN') ?: ''));
+
 // Criar diretórios necessários
 foreach ([OUTPUT_DIR, CACHE_DIR, LOG_DIR] as $dir) {
     if (!is_dir($dir)) mkdir($dir, 0755, true);
@@ -273,6 +277,106 @@ function criarZip($arquivos, $nomeEmpresa) {
     return false;
 }
 
+// Envia o conteúdo gerado para a Netlify
+function deployParaNetlify($caminhoZip, $nomeEmpresa)
+{
+    $siteId = NETLIFY_SITE_ID;
+    $authToken = NETLIFY_AUTH_TOKEN;
+
+    if (empty($siteId) || empty($authToken)) {
+        registrarLog('INFO', 'Configuração Netlify ausente - deploy ignorado');
+        return [
+            'status' => 'ignorado',
+            'msg' => 'Configurações da Netlify não encontradas. Defina NETLIFY_SITE_ID e NETLIFY_AUTH_TOKEN para habilitar o deploy automático.'
+        ];
+    }
+
+    if (empty($caminhoZip) || !file_exists($caminhoZip)) {
+        registrarLog('ERRO', 'Deploy Netlify abortado - arquivo ZIP não encontrado');
+        return [
+            'status' => 'erro',
+            'msg' => 'Arquivo ZIP não encontrado para deploy na Netlify.'
+        ];
+    }
+
+    $url = "https://api.netlify.com/api/v1/sites/{$siteId}/deploys";
+    $boundary = '--------------------------' . bin2hex(random_bytes(12));
+    $zipConteudo = file_get_contents($caminhoZip);
+
+    if ($zipConteudo === false) {
+        registrarLog('ERRO', 'Falha ao ler arquivo ZIP para envio à Netlify');
+        return [
+            'status' => 'erro',
+            'msg' => 'Não foi possível ler o arquivo ZIP para deploy na Netlify.'
+        ];
+    }
+
+    $nomeArquivo = basename($caminhoZip);
+    $body  = "--{$boundary}\r\n";
+    $body .= "Content-Disposition: form-data; name=\"file\"; filename=\"{$nomeArquivo}\"\r\n";
+    $body .= "Content-Type: application/zip\r\n\r\n";
+    $body .= $zipConteudo . "\r\n";
+    $body .= "--{$boundary}--\r\n";
+
+    $headers = [
+        'Authorization: Bearer ' . $authToken,
+        'Content-Type: multipart/form-data; boundary=' . $boundary,
+        'Content-Length: ' . strlen($body),
+        'User-Agent: Auto-Deploy-CNPJ/1.0'
+    ];
+
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 60);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $error = curl_error($ch);
+    curl_close($ch);
+
+    if ($error) {
+        registrarLog('ERRO', "Erro cURL Netlify: {$error}");
+        return [
+            'status' => 'erro',
+            'msg' => 'Erro ao enviar deploy para a Netlify: ' . $error
+        ];
+    }
+
+    $dadosResposta = json_decode($response, true) ?: [];
+
+    if ($httpCode >= 200 && $httpCode < 300) {
+        $deployUrl = $dadosResposta['deploy_url'] ?? '';
+        $sslUrl = $dadosResposta['ssl_url'] ?? '';
+        $adminUrl = $dadosResposta['admin_url'] ?? '';
+        $state = $dadosResposta['state'] ?? '';
+
+        registrarLog('SUCESSO', "Deploy enviado para Netlify para {$nomeEmpresa} - estado: {$state}");
+
+        return [
+            'status' => 'sucesso',
+            'msg' => 'Deploy enviado para a Netlify com sucesso! Aguarde a conclusão do processamento.',
+            'dados' => [
+                'deploy_url' => $deployUrl,
+                'ssl_url' => $sslUrl,
+                'admin_url' => $adminUrl,
+                'state' => $state,
+            ]
+        ];
+    }
+
+    $mensagemErro = $dadosResposta['message'] ?? $dadosResposta['error'] ?? 'Resposta inesperada da Netlify.';
+    registrarLog('ERRO', "Falha ao enviar deploy Netlify ({$httpCode}): {$mensagemErro}");
+
+    return [
+        'status' => 'erro',
+        'msg' => 'Falha ao enviar deploy para a Netlify. Status: ' . $httpCode . ' - ' . $mensagemErro
+    ];
+}
+
 // Gerar token CSRF
 if (!isset($_SESSION['csrf_token'])) {
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
@@ -283,6 +387,7 @@ $dados = null;
 $resultados = null;
 $erro = null;
 $zipFile = null;
+$deployResultado = null;
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // Validação CSRF
@@ -363,10 +468,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 
                 $dados = $replacements;
                 $resultados = processarArquivos($replacements);
-                
+
                 // Criar ZIP
                 $zipFile = criarZip($resultados, $nomeFantasia);
-                
+
+                // Deploy automático para Netlify
+                $caminhoZipCompleto = $zipFile ? OUTPUT_DIR . '/' . $zipFile : null;
+                $deployResultado = deployParaNetlify($caminhoZipCompleto, $nomeFantasia);
+
                 // Salvar no histórico
                 salvarHistorico([
                     'cnpj' => $cnpjLimpo,
@@ -842,7 +951,47 @@ if (isset($_GET['ver_historico']) && file_exists(HISTORICO_FILE)) {
                         📂 Acesse os arquivos diretamente em: <code><?= OUTPUT_DIR ?></code>
                     </div>
                 <?php endif; ?>
-                
+
+                <?php if ($deployResultado): ?>
+                    <?php if ($deployResultado['status'] === 'sucesso'): ?>
+                        <?php $deployDados = $deployResultado['dados'] ?? []; ?>
+                        <div class="alert alert-success">
+                            <strong>🌍 Deploy Netlify:</strong> <?= htmlspecialchars($deployResultado['msg']) ?>
+                            <div style="margin-top: 10px; line-height: 1.6;">
+                                <?php if (!empty($deployDados['deploy_url'])): ?>
+                                    🚀 <strong>Preview:</strong>
+                                    <a href="<?= htmlspecialchars($deployDados['deploy_url']) ?>" target="_blank" style="color: #1565c0;">
+                                        <?= htmlspecialchars($deployDados['deploy_url']) ?>
+                                    </a><br>
+                                <?php endif; ?>
+                                <?php if (!empty($deployDados['ssl_url'])): ?>
+                                    🔒 <strong>Produção:</strong>
+                                    <a href="<?= htmlspecialchars($deployDados['ssl_url']) ?>" target="_blank" style="color: #1565c0;">
+                                        <?= htmlspecialchars($deployDados['ssl_url']) ?>
+                                    </a><br>
+                                <?php endif; ?>
+                                <?php if (!empty($deployDados['admin_url'])): ?>
+                                    🛠️ <strong>Painel:</strong>
+                                    <a href="<?= htmlspecialchars($deployDados['admin_url']) ?>" target="_blank" style="color: #1565c0;">
+                                        <?= htmlspecialchars($deployDados['admin_url']) ?>
+                                    </a><br>
+                                <?php endif; ?>
+                                <?php if (!empty($deployDados['state'])): ?>
+                                    📡 <strong>Status inicial:</strong> <?= htmlspecialchars($deployDados['state']) ?>
+                                <?php endif; ?>
+                            </div>
+                        </div>
+                    <?php elseif ($deployResultado['status'] === 'erro'): ?>
+                        <div class="alert alert-error">
+                            <strong>⚠️ Deploy Netlify:</strong> <?= htmlspecialchars($deployResultado['msg']) ?>
+                        </div>
+                    <?php else: ?>
+                        <div class="info-box">
+                            ℹ️ <?= htmlspecialchars($deployResultado['msg']) ?>
+                        </div>
+                    <?php endif; ?>
+                <?php endif; ?>
+
                 <div class="info-box">
                     📂 <strong>Local dos arquivos:</strong> <code><?= OUTPUT_DIR ?></code><br>
                     💾 Arquivos são mantidos por 7 dias e depois excluídos automaticamente
